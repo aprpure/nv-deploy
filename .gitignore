@@ -1,0 +1,10 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.pyc
+config.json
+nvidia_keys.csv
+nvidia_keys.txt
+logs/
+tmp/
+

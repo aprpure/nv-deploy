@@ -1,0 +1,19 @@
+{
+  "llm": {
+    "type": "openai",
+    "api_key": "",
+    "base_url": "https://api.openai.com/v1",
+    "model": "gpt-4o",
+    "json_mode": true,
+    "proxy": "",
+    "gemini_model": "gemini-3.7-flash",
+    "gemini_proxy": "",
+    "gemini_base_url": "",
+    "openai_api_key": "",
+    "openai_base_url": "https://api.openai.com/v1",
+    "openai_model": "gpt-4o",
+    "openai_proxy": "",
+    "openai_thinking": false,
+    "openai_reasoning_effort": ""
+  }
+}

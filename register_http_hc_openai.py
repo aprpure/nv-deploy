@@ -1256,6 +1256,25 @@ class NvidiaHttpRegister:
                                                 tag=f"[{email_address}]" if email_address else "")
         self.key = None
         self._email = email_address or ""
+        # NVGS 端点（默认 .com；若会话重定向落到 .cn 域名则动态切换）
+        self.nvgs_login = "https://login.nvgs.nvidia.com"
+        self.nvgs_base = NVGS_BASE
+        self.nvgs_validator = NVGS_VALIDATOR
+        self.login_nvidia = LOGIN_NVIDIA
+
+        def _switch_nvgs_venue(suffix: str):
+            if suffix == ".com":
+                self.nvgs_login = "https://login.nvgs.nvidia.com"
+                self.nvgs_base = "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth"
+                self.nvgs_validator = "https://accounts.nvgs.nvidia.com/api/1"
+                self.login_nvidia = "https://login.nvidia.com"
+            elif suffix == ".cn":
+                self.nvgs_login = "https://login.nvgs.nvidia.cn"
+                self.nvgs_base = "https://accounts.nvgs.nvidia.cn/api/1/frontend/oauth"
+                self.nvgs_validator = "https://accounts.nvgs.nvidia.cn/api/1"
+                self.login_nvidia = "https://login.nvidia.cn"
+
+        self._switch_nvgs_venue = _switch_nvgs_venue
 
     def _p(self, *args):
         print(f"[{self._email}]" if self._email else "[?]", *args, flush=True)
@@ -1286,8 +1305,8 @@ class NvidiaHttpRegister:
     def _nvgs_headers(self):
         return {
             "Accept": "application/json, text/plain, */*",
-            "Origin": "https://login.nvgs.nvidia.com",
-            "Referer": "https://login.nvgs.nvidia.com/",
+            "Origin": self.nvgs_login,
+            "Referer": f"{self.nvgs_login}/",
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.key}",
         }
@@ -1295,13 +1314,13 @@ class NvidiaHttpRegister:
     def _nvgs(self, method, path, body=None, auth=True):
         headers = {
             "Accept": "application/json, text/plain, */*",
-            "Origin": "https://login.nvgs.nvidia.com",
-            "Referer": "https://login.nvgs.nvidia.com/",
+            "Origin": self.nvgs_login,
+            "Referer": f"{self.nvgs_login}/",
             "Content-Type": "application/json",
         }
         if auth:
             headers["Authorization"] = f"Bearer {self.key}"
-        url = f"{NVGS_BASE}{path}"
+        url = f"{self.nvgs_base}{path}"
         if method == "GET":
             r = self.client.get(url, headers=headers)
         else:
@@ -1348,9 +1367,9 @@ class NvidiaHttpRegister:
                    {"browserMode": "Private", "passkeySupported": True})
         self._nvgs("GET", "/login/mode")
         self._nvgs("GET", "/client")
-        self.client.get(f"{NVGS_VALIDATOR}/validation")
+        self.client.get(f"{self.nvgs_validator}/validation")
         r = self.client.get(
-            f"{NVGS_VALIDATOR}/validator/checkAccount",
+            f"{self.nvgs_validator}/validator/checkAccount",
             headers=self._nvgs_headers())
         if r.status_code != 204:
             raise RuntimeError(f"checkAccount 异常: {r.status_code}")
@@ -1365,11 +1384,11 @@ class NvidiaHttpRegister:
         self._nvgs("GET", "/external?order=Preferred")
         self._nvgs("GET", "/announcement?screen=EmailEntry&locale=zh-CN")
         self._nvgs("POST", "/log", {"type": "AccountCreateInitiated"})
-        self.client.get(f"{NVGS_VALIDATOR}/password/validation/policy")
+        self.client.get(f"{self.nvgs_validator}/password/validation/policy")
 
         self._p("  [NVGS] 获取 hCaptcha 挑战...")
         r = self.client.get(
-            f"{NVGS_VALIDATOR}/validator/register",
+            f"{self.nvgs_validator}/validator/register",
             headers=self._nvgs_headers())
         challenge = r.json()["validation"]
         validator_key = challenge["key"]["token"]
@@ -1467,13 +1486,13 @@ class NvidiaHttpRegister:
             if not state:
                 raise RuntimeError(f"未从同意页提取 state: {final_url}")
             self._p("  [同意] 提交同意...")
-            r = self.client.post(f"{LOGIN_NVIDIA}/callback/consent",
+            r = self.client.post(f"{self.login_nvidia}/callback/consent",
                                  data={"trackBehavioralData": "false",
                                        "opt_in": "false",
                                        "state": state[0]})
             if r.status_code not in (301, 302, 303):
                 raise RuntimeError(f"同意提交失败: {r.status_code} {r.text[:200]}")
-            session_url = str(httpx.URL(f"{LOGIN_NVIDIA}/callback/consent").join(
+            session_url = str(httpx.URL(f"{self.login_nvidia}/callback/consent").join(
                 r.headers["location"]))
         elif "/session" in final_url:
             session_url = final_url
@@ -1483,9 +1502,13 @@ class NvidiaHttpRegister:
         r = self._walk_redirects(session_url)
         final_url = str(r.url)
         q = parse_qs(urlparse(final_url).query)
-        if "login.nvgs.nvidia.com" in final_url and "key" in q:
+        m = re.match(r"https://login\.nvgs\.nvidia\.(com|cn)/", final_url)
+        if m and "key" in q:
+            if m.group(1) == "cn":
+                self._switch_nvgs_venue(".cn")
+                self._p("  [OAuth] 会话落在 .cn 端点，NVGS 后续请求切换至 .cn")
             self.key = q["key"][0]
-            self._p("  [OAuth] 第二轮 key 已获取")
+            self._p(f"  [OAuth] 第二轮 key 已获取 (venue={m.group(1)})")
             return True
         if "build.nvidia.com" in final_url:
             self._p("  [OAuth] 已直接登录（无需第二轮）")
@@ -1515,11 +1538,11 @@ class NvidiaHttpRegister:
         if not state:
             raise RuntimeError(f"未从 select-account 提取 state: {final_url}")
         self._p(f"  [NCA] 创建组织 {org_name} ...")
-        r = self.client.post(f"{LOGIN_NVIDIA}/callback/nca_picker",
+        r = self.client.post(f"{self.login_nvidia}/callback/nca_picker",
                              data={"state": state[0], "action": "create", "name": org_name})
         if r.status_code not in (301, 302, 303):
             raise RuntimeError(f"nca_picker 失败: {r.status_code} {r.text[:200]}")
-        session_url = str(httpx.URL(f"{LOGIN_NVIDIA}/callback/nca_picker").join(r.headers["location"]))
+        session_url = str(httpx.URL(f"{self.login_nvidia}/callback/nca_picker").join(r.headers["location"]))
         r = self._walk_redirects(session_url)
         if "build.nvidia.com" not in str(r.url):
             raise RuntimeError(f"NCA 后未回到 build.nvidia.com: {r.url}")

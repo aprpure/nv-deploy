@@ -1168,13 +1168,17 @@ def _install_challenger_frame_patch():
 
     1) get_challenge_frame_locator：iframe 竞态返回 None 时短重试多次，
        避免 challenge 方法直接 AttributeError 崩溃；
-    2) refresh_challenge：frame 为 None 时安全跳过（原实现会直接崩）。
+    2) refresh_challenge：frame 为 None 时安全跳过（原实现会直接崩）；
+    3) _review_challenge_type：
+       - 题目（requester_question 所有语言）全空 → 刷新换题；
+       - 题目只在非 en 语言键（如 zh）→ 补齐到 en 键，避免库读不到题目。
     """
     global _CHALLENGER_PATCHED
     if _CHALLENGER_PATCHED:
         return
     import hcaptcha_challenger.agent.challenger as ch_mod
     RoboticArm = ch_mod.RoboticArm
+    AgentV = ch_mod.AgentV
 
     _orig_get_frame = RoboticArm.get_challenge_frame_locator
 
@@ -1196,8 +1200,29 @@ def _install_challenger_frame_patch():
         refresh_element = frame.locator("//div[@class='refresh button']")
         await self.click_by_mouse(refresh_element)
 
+    _orig_review = AgentV._review_challenge_type
+
+    async def _review_question_guard(self):
+        for _ in range(5):
+            ctype = await _orig_review(self)
+            p = self._captcha_payload
+            rq = (p.requester_question if p else None) or {}
+            vals = [str(v).strip() for v in rq.values() if str(v).strip()]
+            if not vals:
+                print(f"[hcc-patch] 题目为空，刷新换题 (type={getattr(ctype, 'value', ctype)})",
+                      flush=True)
+                await self.page.wait_for_timeout(2000)
+                await self.robotic_arm.refresh_challenge()
+                continue
+            # 题目只在 zh 等语言键：补齐到 en，供库 _match_user_prompt 读取
+            if p and rq and not str(rq.get("en", "")).strip():
+                rq["en"] = vals[0]
+            return ctype
+        return ctype
+
     RoboticArm.get_challenge_frame_locator = _get_frame_retry
     RoboticArm.refresh_challenge = _safe_refresh
+    AgentV._review_challenge_type = _review_question_guard
     _CHALLENGER_PATCHED = True
 
     def solve(self) -> str:
@@ -1213,7 +1238,7 @@ def _install_challenger_frame_patch():
     async def _solve_async(self) -> str:
         from playwright.async_api import async_playwright
         from hcaptcha_challenger.agent import AgentV, AgentConfig
-        from hcaptcha_challenger.models import ChallengeSignal, ChallengeTypeEnum
+        from hcaptcha_challenger.models import ChallengeSignal
 
         _install_challenger_frame_patch()
 
@@ -1261,9 +1286,6 @@ def _install_challenger_frame_patch():
                     challenge_dir=work_dir / "challenge",
                     captcha_response_dir=work_dir / "captcha",
                     enable_skills_update=False,
-                    # 模型对多物体拖拽题输出空坐标时会白等 30s 超时，
-                    # 直接跳过让库刷新换题
-                    ignore_request_types=[ChallengeTypeEnum.IMAGE_DRAG_MULTI],
                 )
                 if LLM_TYPE == "gemini":
                     config.IMAGE_CLASSIFIER_MODEL = GEMINI_MODEL

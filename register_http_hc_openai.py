@@ -1537,16 +1537,28 @@ class NvidiaHttpRegister:
         state = parse_qs(urlparse(final_url).query).get("state")
         if not state:
             raise RuntimeError(f"未从 select-account 提取 state: {final_url}")
-        self._p(f"  [NCA] 创建组织 {org_name} ...")
-        r = self.client.post(f"{self.login_nvidia}/callback/nca_picker",
-                             data={"state": state[0], "action": "create", "name": org_name})
-        if r.status_code not in (301, 302, 303):
-            raise RuntimeError(f"nca_picker 失败: {r.status_code} {r.text[:200]}")
-        session_url = str(httpx.URL(f"{self.login_nvidia}/callback/nca_picker").join(r.headers["location"]))
-        r = self._walk_redirects(session_url)
-        if "build.nvidia.com" not in str(r.url):
-            raise RuntimeError(f"NCA 后未回到 build.nvidia.com: {r.url}")
-        self._p("  [NCA] 组织创建完成，已登录 build.nvidia.com")
+        # 回调 host 优先从 select-account 页面 URL 推导（state 由该 host 签发），
+        # 401 时自动尝试另一个 .com / .cn 变体（venue 与登录回调可能不同域）
+        m = re.match(r"https://(login\.nvidia\.(?:com|cn))", final_url)
+        primary = f"https://{m.group(1)}" if m else self.login_nvidia
+        other = f"https://login.nvidia.cn" if primary.endswith(".com") else f"https://login.nvidia.com"
+        self._p(f"  [NCA] 创建组织 {org_name} (回调 host={primary}) ...")
+        last_err = None
+        for base in dict.fromkeys([primary, other]):
+            r = self.client.post(f"{base}/callback/nca_picker",
+                                 data={"state": state[0], "action": "create", "name": org_name})
+            if r.status_code in (301, 302, 303):
+                if base != primary:
+                    self._p(f"  [NCA] {primary} 被拒，回退 {base} 成功")
+                session_url = str(httpx.URL(f"{base}/callback/nca_picker").join(r.headers["location"]))
+                r2 = self._walk_redirects(session_url)
+                if "build.nvidia.com" not in str(r2.url):
+                    raise RuntimeError(f"NCA 后未回到 build.nvidia.com: {r2.url}")
+                self._p("  [NCA] 组织创建完成，已登录 build.nvidia.com")
+                return
+            last_err = f"{base}: {r.status_code} {r.text[:200]}"
+            self._p(f"  [NCA] {last_err}")
+        raise RuntimeError(f"nca_picker 失败（所有 host 均尝试）: {last_err}")
 
     # ---- 8. NGC API ----
     def ngc_create_key(self, org_name):

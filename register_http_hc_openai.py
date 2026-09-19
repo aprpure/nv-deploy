@@ -356,6 +356,8 @@ class OpenAIProvider:
         description: str | None = None,
         **kwargs,
     ) -> ResponseT:
+        t0 = time.time()
+        print(f"  [AI-Req] 开始请求模型 {self._model} (图片数={len(images)}, prompt={str(user_prompt)[:60]!r})...", flush=True)
         content: list = []
         for img in images:
             img = Path(img)
@@ -397,13 +399,15 @@ class OpenAIProvider:
                 resp = await self._client.post("/chat/completions", json=payload)
                 resp.raise_for_status()
                 text = resp.json()["choices"][0]["message"]["content"]
+                elapsed = time.time() - t0
+                print(f"  [AI-Resp] 模型响应成功 (耗时 {elapsed:.1f}s, 输出长度 {len(text)} 字符)", flush=True)
                 return self._parse_response(text, response_schema)
             except Exception as e:
                 last_err = e
                 if isinstance(e, httpx.HTTPError):
                     req = getattr(e, "request", None)
                     print(f"  [AI] 尝试 {attempt+1}/3 失败: {type(e).__name__}: {str(e)[:150]}"
-                          + (f" ({req.url.host})" if req is not None else ""))
+                          + (f" ({req.url.host})" if req is not None else ""), flush=True)
                 if attempt < 2:
                     is_429 = isinstance(e, httpx.HTTPStatusError) and getattr(e.response, "status_code", None) == 429
                     await asyncio.sleep(10 if is_429 else 2 * (attempt + 1))
@@ -1250,9 +1254,32 @@ def _install_challenger_frame_patch():
             return f"Challenge Instruction: {real_question}\n\n{skill_prompt}"
         return skill_prompt
 
+    async def challenge_image_drag_drop_guard(self, job_type: ChallengeTypeEnum):
+        # 兜底：如果进入拖拽题时，题目仍然未就位，直接在求解前从当前 DOM 强行抓取并写进 payload！
+        try:
+            rq = (self.captcha_payload.requester_question if self.captcha_payload else None) or {}
+            vals = [str(v).strip() for v in rq.values() if str(v).strip()]
+            if not vals:
+                frame = await self.get_challenge_frame_locator()
+                if frame:
+                    el = frame.locator("//*[@id='prompt-question'] | //h2[@class='prompt-text']")
+                    if await el.first.is_visible(timeout=2000):
+                        dom_text = (await el.first.inner_text()).strip()
+                        if dom_text:
+                            print(f"[hcc-patch] challenge_drag 阶段从 DOM 强制补救题目: {dom_text!r}", flush=True)
+                            if self.captcha_payload:
+                                self.captcha_payload.requester_question = {"zh": dom_text, "en": dom_text}
+                            self._challenge_prompt = dom_text
+        except Exception as e:
+            print(f"[hcc-patch] DOM 补救异常: {e}", flush=True)
+
+        return await _orig_drag_drop(self, job_type)
+
     RoboticArm.get_challenge_frame_locator = _get_frame_retry
     RoboticArm.refresh_challenge = _safe_refresh
     RoboticArm._match_user_prompt = _match_user_prompt_inject
+    _orig_drag_drop = RoboticArm.challenge_image_drag_drop
+    RoboticArm.challenge_image_drag_drop = challenge_image_drag_drop_guard
     AgentV._review_challenge_type = _review_question_guard
     _CHALLENGER_PATCHED = True
 

@@ -1173,14 +1173,26 @@ def _install_challenger_frame_patch():
 
     _orig_get_frame = RoboticArm.get_challenge_frame_locator
 
-    async def _get_frame_retry(self, retries=5):
-        frame = await _orig_get_frame(self)
+    async def _get_frame_retry(self, retries=8):
+        # 1. 优先调用原库定位逻辑（带短轮询）
         for _ in range(retries):
+            frame = await _orig_get_frame(self)
             if frame is not None:
                 return frame
+            # 2. 如果原库找不到，直接从全局 page.frames 扫描带有 frame=challenge 的 iframe
+            try:
+                for f in self.page.frames:
+                    if "frame=challenge" in (f.url or ""):
+                        # 只要有挑战容器或其根节点就命中
+                        cv = f.locator("//div[contains(@class, 'challenge-view')] | //div[contains(@class, 'challenge-container')]")
+                        if await cv.first.is_visible(timeout=500):
+                            return f
+                        # 即使 challenge-view 还没完成渲染，但 frame 已经就位，也直接返回该 frame
+                        return f
+            except Exception:
+                pass
             await self.page.wait_for_timeout(800)
-            frame = await _orig_get_frame(self)
-        return frame
+        return None
 
     async def _safe_refresh(self):
         frame = await self.get_challenge_frame_locator()

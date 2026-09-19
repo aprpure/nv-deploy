@@ -1160,6 +1160,46 @@ class HcaptchaChallengerSolver:
     def _p(self, *args):
         print(self.tag or "[?]", *args, flush=True)
 
+_CHALLENGER_PATCHED = False
+
+
+def _install_challenger_frame_patch():
+    """库兼容补丁（幂等）：
+
+    1) get_challenge_frame_locator：iframe 竞态返回 None 时短重试多次，
+       避免 challenge 方法直接 AttributeError 崩溃；
+    2) refresh_challenge：frame 为 None 时安全跳过（原实现会直接崩）。
+    """
+    global _CHALLENGER_PATCHED
+    if _CHALLENGER_PATCHED:
+        return
+    import hcaptcha_challenger.agent.challenger as ch_mod
+    RoboticArm = ch_mod.RoboticArm
+
+    _orig_get_frame = RoboticArm.get_challenge_frame_locator
+
+    async def _get_frame_retry(self, retries=5):
+        frame = await _orig_get_frame(self)
+        for _ in range(retries):
+            if frame is not None:
+                return frame
+            await self.page.wait_for_timeout(800)
+            frame = await _orig_get_frame(self)
+        return frame
+
+    async def _safe_refresh(self):
+        frame = await self.get_challenge_frame_locator()
+        if frame is None:
+            print("[hcc-patch] challenge iframe 不可见，跳过刷新等待下一轮", flush=True)
+            await self.page.wait_for_timeout(2000)
+            return
+        refresh_element = frame.locator("//div[@class='refresh button']")
+        await self.click_by_mouse(refresh_element)
+
+    RoboticArm.get_challenge_frame_locator = _get_frame_retry
+    RoboticArm.refresh_challenge = _safe_refresh
+    _CHALLENGER_PATCHED = True
+
     def solve(self) -> str:
         last_err = None
         for attempt in range(1, 4):
@@ -1173,7 +1213,9 @@ class HcaptchaChallengerSolver:
     async def _solve_async(self) -> str:
         from playwright.async_api import async_playwright
         from hcaptcha_challenger.agent import AgentV, AgentConfig
-        from hcaptcha_challenger.models import ChallengeSignal
+        from hcaptcha_challenger.models import ChallengeSignal, ChallengeTypeEnum
+
+        _install_challenger_frame_patch()
 
         work_dir = Path(__file__).resolve().parent / "tmp" / "hcc"
         async with async_playwright() as p:
@@ -1219,6 +1261,9 @@ class HcaptchaChallengerSolver:
                     challenge_dir=work_dir / "challenge",
                     captcha_response_dir=work_dir / "captcha",
                     enable_skills_update=False,
+                    # 模型对多物体拖拽题输出空坐标时会白等 30s 超时，
+                    # 直接跳过让库刷新换题
+                    ignore_request_types=[ChallengeTypeEnum.IMAGE_DRAG_MULTI],
                 )
                 if LLM_TYPE == "gemini":
                     config.IMAGE_CLASSIFIER_MODEL = GEMINI_MODEL

@@ -259,6 +259,15 @@ def _coerce_model_payload(data: dict) -> dict:
             data["points"] = [{"x": int(x), "y": int(y)}
                               for x, y in zip(xs, ys)]
 
+    # 模型误把 schema 声明 ($defs / properties) 抄回来的清洗防护
+    if "$defs" in data or "properties" in data:
+        # 如果模型把 schema 抄回来了，检查是否完全没有真实 coordinates/paths
+        has_real_paths = any(isinstance(p, dict) and ("start_point" in p or "from" in p or "start" in p) for p in data.get("paths", []))
+        if not has_real_paths:
+            data["paths"] = []
+        if isinstance(data.get("challenge_prompt"), (dict, list)):
+            data["challenge_prompt"] = ""
+
     # coordinates：[[r,c],...] → [{"box_2d":[r,c]},...]
     if isinstance(data.get("challenge_prompt"), (dict, list)):
         # 模型误把 schema 当输出，丢弃
@@ -383,9 +392,12 @@ class OpenAIProvider:
         if description:
             sys_parts.append(description)
         sys_parts.append(
-            "You MUST reply with ONLY a valid JSON object matching this schema: "
+            "CRITICAL: Solve the challenge and output the result JSON.\n"
+            "Format example:\n"
+            '{"challenge_prompt": "drag matching elements", "paths": [{"start_point": {"x": 100, "y": 200}, "end_point": {"x": 300, "y": 400}}]}\n\n'
+            "Schema definition:\n"
             + json.dumps(response_schema.model_json_schema(), ensure_ascii=False)
-            + ". Do NOT include markdown fences or any text outside the JSON."
+            + "\n\nDo NOT echo the schema definitions ($defs, properties, title). Output ONLY the concrete solution with coordinates. No markdown."
         )
         messages.append({"role": "system", "content": "\n\n".join(sys_parts)})
         messages.append({"role": "user", "content": content})

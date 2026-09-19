@@ -282,14 +282,21 @@ def _coerce_model_payload(data: dict) -> dict:
                 fixed.append(c)
             data["coordinates"] = fixed
 
-    # paths：[{start_point,end_point},...]，start/end 可能是 [x,y] 或 {"x":[..]}
-    if isinstance(data.get("paths"), list):
+    # paths：[{start_point,end_point},...]，也容忍模型返回 from/to 或 [start, end]
+    raw_paths = data.get("paths")
+    # 容忍模型把路径放在 "coordinates" 或 "from_to"
+    if not raw_paths and isinstance(data.get("coordinates"), list):
+        if data["coordinates"] and isinstance(data["coordinates"][0], dict) and ("from" in data["coordinates"][0] or "start" in data["coordinates"][0]):
+            raw_paths = data["coordinates"]
+
+    if isinstance(raw_paths, list):
         fixed = []
-        for p in data["paths"]:
+        for p in raw_paths:
             if not isinstance(p, dict):
                 continue
-            sp = p.get("start_point")
-            ep = p.get("end_point")
+            # 兼容模型输出 from / to 字段
+            sp = p.get("start_point") or p.get("from") or p.get("start")
+            ep = p.get("end_point") or p.get("to") or p.get("end")
             if isinstance(sp, list):
                 sp = _to_point(sp)
             if isinstance(ep, list):
@@ -298,7 +305,8 @@ def _coerce_model_payload(data: dict) -> dict:
                 sp = {"x": int(sp["x"][0]), "y": int(sp["x"][1])}
             if isinstance(ep, dict) and isinstance(ep.get("x"), list):
                 ep = {"x": int(ep["x"][0]), "y": int(ep["x"][1])}
-            fixed.append({**p, "start_point": sp, "end_point": ep})
+            if sp and ep:
+                fixed.append({"start_point": _to_point(sp), "end_point": _to_point(ep)})
         data["paths"] = fixed
 
     # 字段丢失兜底：空结构而不是让 pydantic 报 missing
@@ -1275,9 +1283,33 @@ def _install_challenger_frame_patch():
 
         return await _orig_drag_drop(self, job_type)
 
+    # 4) 增强 _perform_drag_drop 或 challenge_image_drag_drop 的坐标映射
+    _orig_perform_drag = RoboticArm._perform_drag_drop
+
+    async def _perform_drag_with_coordinate_mapping(self, path, steps=25, delay_ms=15):
+        from hcaptcha_challenger.models import SpatialPath, PointCoordinate
+        frame_challenge = await self.get_challenge_frame_locator()
+        if frame_challenge:
+            challenge_view = frame_challenge.locator("//div[@class='challenge-view']")
+            bbox = await challenge_view.bounding_box()
+            if bbox and bbox.get("width", 0) > 0:
+                w, h = bbox["width"], bbox["height"]
+                # 模型识别坐标基于网格大图 (1000x940)，按比例映射到屏幕上的 challenge_view 实际像素位置
+                sx = bbox["x"] + (path.start_point.x / 1000.0) * w
+                sy = bbox["y"] + (path.start_point.y / 940.0) * h
+                tx = bbox["x"] + (path.end_point.x / 1000.0) * w
+                ty = bbox["y"] + (path.end_point.y / 940.0) * h
+                mapped_path = SpatialPath(
+                    start_point=PointCoordinate(x=int(sx), y=int(sy)),
+                    end_point=PointCoordinate(x=int(tx), y=int(ty)),
+                )
+                return await _orig_perform_drag(self, mapped_path, steps, delay_ms)
+        return await _orig_perform_drag(self, path, steps, delay_ms)
+
     RoboticArm.get_challenge_frame_locator = _get_frame_retry
     RoboticArm.refresh_challenge = _safe_refresh
     RoboticArm._match_user_prompt = _match_user_prompt_inject
+    RoboticArm._perform_drag_drop = _perform_drag_with_coordinate_mapping
     _orig_drag_drop = RoboticArm.challenge_image_drag_drop
     RoboticArm.challenge_image_drag_drop = challenge_image_drag_drop_guard
     AgentV._review_challenge_type = _review_question_guard

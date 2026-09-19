@@ -1206,41 +1206,31 @@ def _install_challenger_frame_patch():
     _orig_review = AgentV._review_challenge_type
 
     async def _review_question_guard(self):
-        for _ in range(5):
-            ctype = await _orig_review(self)
-            p = self._captcha_payload
-            rq = (p.requester_question if p else None) or {}
-            vals = [str(v).strip() for v in rq.values() if str(v).strip()]
+        ctype = await _orig_review(self)
+        p = self._captcha_payload
+        rq = (p.requester_question if p else None) or {}
+        vals = [str(v).strip() for v in rq.values() if str(v).strip()]
 
-            # 关键：如果 payload 没有题目，尝试从 DOM（#prompt-question / .prompt-text）提取真实题目！
-            dom_text = ""
-            if not vals:
-                try:
-                    frame = await self.robotic_arm.get_challenge_frame_locator()
-                    if frame:
-                        el = frame.locator("//*[@id='prompt-question'] | //h2[@class='prompt-text']")
-                        if await el.first.is_visible(timeout=1500):
-                            dom_text = (await el.first.inner_text()).strip()
-                            if dom_text:
-                                print(f"[hcc-patch] 从 DOM 提取到题目: {dom_text!r}", flush=True)
-                                vals = [dom_text]
-                except Exception:
-                    pass
+        # 关键：如果 payload 没有题目，从 DOM（#prompt-question / .prompt-text）提取真实题目并补齐！
+        if not vals:
+            try:
+                frame = await self.robotic_arm.get_challenge_frame_locator()
+                if frame:
+                    el = frame.locator("//*[@id='prompt-question'] | //h2[@class='prompt-text']")
+                    if await el.first.is_visible(timeout=1500):
+                        dom_text = (await el.first.inner_text()).strip()
+                        if dom_text:
+                            print(f"[hcc-patch] 从 DOM 提取到题目: {dom_text!r}", flush=True)
+                            vals = [dom_text]
+            except Exception:
+                pass
 
-            if not vals:
-                print(f"[hcc-patch] 题目为空（DOM 与 payload 均无），刷新换题 (type={getattr(ctype, 'value', ctype)})",
-                      flush=True)
-                await self.page.wait_for_timeout(2000)
-                await self.robotic_arm.refresh_challenge()
-                continue
-
-            # 将提取到的题目补齐到 en 和 zh，确保库的 _match_user_prompt 与 skills 正确命中
-            if p:
-                if not p.requester_question:
-                    p.requester_question = {}
-                p.requester_question["en"] = vals[0]
-                p.requester_question["zh"] = vals[0]
-            return ctype
+        # 将提取到的题目补齐到 en 和 zh，确保库的 _match_user_prompt 与 skills 正确命中
+        if vals and p:
+            if not p.requester_question:
+                p.requester_question = {}
+            p.requester_question["en"] = vals[0]
+            p.requester_question["zh"] = vals[0]
         return ctype
 
     RoboticArm.get_challenge_frame_locator = _get_frame_retry

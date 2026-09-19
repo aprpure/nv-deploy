@@ -351,8 +351,10 @@ class OpenAIProvider:
         except Exception:
             data = extract_first_json_block(text)
         if not data:
+            print(f"  [AI-Raw] 模型原始返回(无法解析): {text[:300]!r}", flush=True)
             raise ValueError(f"无法解析模型输出为 JSON: {text[:300]}")
         data = _coerce_model_payload(data)
+        print(f"  [AI-Parsed] 整理后数据: {data}", flush=True)
         return response_schema(**data)
 
     async def generate_with_images(

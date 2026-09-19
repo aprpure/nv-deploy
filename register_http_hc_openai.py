@@ -1233,8 +1233,26 @@ def _install_challenger_frame_patch():
             p.requester_question["zh"] = vals[0]
         return ctype
 
+    # 3) _match_user_prompt：确保无论 skill 规则是否命中，真实题目文本都会被注入到 Prompt 中！
+    _orig_match_prompt = RoboticArm._match_user_prompt
+
+    def _match_user_prompt_inject(self, job_type):
+        skill_prompt = _orig_match_prompt(self, job_type)
+        real_question = ""
+        if self.captcha_payload and self.captcha_payload.requester_question:
+            rq = self.captcha_payload.requester_question
+            real_question = rq.get("zh") or rq.get("en") or next((v for v in rq.values() if v), "")
+        elif self._challenge_prompt:
+            real_question = self._challenge_prompt
+
+        if real_question:
+            # 将真实题目置顶显式告诉模型，避免 skill_manager 仅返回 JobType: xxx 的尴尬
+            return f"Challenge Instruction: {real_question}\n\n{skill_prompt}"
+        return skill_prompt
+
     RoboticArm.get_challenge_frame_locator = _get_frame_retry
     RoboticArm.refresh_challenge = _safe_refresh
+    RoboticArm._match_user_prompt = _match_user_prompt_inject
     AgentV._review_challenge_type = _review_question_guard
     _CHALLENGER_PATCHED = True
 

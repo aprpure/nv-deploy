@@ -1150,16 +1150,7 @@ def _install_library_voting(votes=3):
     print(f"  [验证] 已启用原库投票（{votes} 轮）")
 
 
-# ---------------- hCaptcha Challenger 求解器（本地浏览器 + OpenAI 视觉模型） ----------------
-class HcaptchaChallengerSolver:
-    def __init__(self, proxy=None, headless=False, tag=""):
-        self.proxy = proxy
-        self.headless = headless
-        self.tag = tag
-
-    def _p(self, *args):
-        print(self.tag or "[?]", *args, flush=True)
-
+# ---------------- hCaptcha Challenger 库兼容补丁 ----------------
 _CHALLENGER_PATCHED = False
 
 
@@ -1224,6 +1215,17 @@ def _install_challenger_frame_patch():
     RoboticArm.refresh_challenge = _safe_refresh
     AgentV._review_challenge_type = _review_question_guard
     _CHALLENGER_PATCHED = True
+
+
+# ---------------- hCaptcha Challenger 求解器（本地浏览器 + OpenAI 视觉模型） ----------------
+class HcaptchaChallengerSolver:
+    def __init__(self, proxy=None, headless=False, tag=""):
+        self.proxy = proxy
+        self.headless = headless
+        self.tag = tag
+
+    def _p(self, *args):
+        print(self.tag or "[?]", *args, flush=True)
 
     def solve(self) -> str:
         last_err = None

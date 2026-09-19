@@ -1199,15 +1199,35 @@ def _install_challenger_frame_patch():
             p = self._captcha_payload
             rq = (p.requester_question if p else None) or {}
             vals = [str(v).strip() for v in rq.values() if str(v).strip()]
+
+            # 关键：如果 payload 没有题目，尝试从 DOM（#prompt-question / .prompt-text）提取真实题目！
+            dom_text = ""
             if not vals:
-                print(f"[hcc-patch] 题目为空，刷新换题 (type={getattr(ctype, 'value', ctype)})",
+                try:
+                    frame = await self.robotic_arm.get_challenge_frame_locator()
+                    if frame:
+                        el = frame.locator("//*[@id='prompt-question'] | //h2[@class='prompt-text']")
+                        if await el.first.is_visible(timeout=1500):
+                            dom_text = (await el.first.inner_text()).strip()
+                            if dom_text:
+                                print(f"[hcc-patch] 从 DOM 提取到题目: {dom_text!r}", flush=True)
+                                vals = [dom_text]
+                except Exception:
+                    pass
+
+            if not vals:
+                print(f"[hcc-patch] 题目为空（DOM 与 payload 均无），刷新换题 (type={getattr(ctype, 'value', ctype)})",
                       flush=True)
                 await self.page.wait_for_timeout(2000)
                 await self.robotic_arm.refresh_challenge()
                 continue
-            # 题目只在 zh 等语言键：补齐到 en，供库 _match_user_prompt 读取
-            if p and rq and not str(rq.get("en", "")).strip():
-                rq["en"] = vals[0]
+
+            # 将提取到的题目补齐到 en 和 zh，确保库的 _match_user_prompt 与 skills 正确命中
+            if p:
+                if not p.requester_question:
+                    p.requester_question = {}
+                p.requester_question["en"] = vals[0]
+                p.requester_question["zh"] = vals[0]
             return ctype
         return ctype
 

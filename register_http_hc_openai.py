@@ -1680,7 +1680,9 @@ if __name__ == "__main__":
     parser.add_argument("-b", "--browser", type=int, default=3,
                         help="最大并发浏览器数（验证码求解槽位，默认: 3，控制内存峰值）")
     parser.add_argument("-p", "--proxy", type=str, default=None,
-                        help="HTTP 代理 (默认: http://127.0.0.1:7890)")
+                        help="HTTP 代理 (例如: http://127.0.0.1:7890 或 socks5://...；境外机器可传 --no-proxy 或留空)")
+    parser.add_argument("--no-proxy", action="store_true",
+                        help="强制不使用代理（直连访问）")
     parser.add_argument("--openai-key", type=str, default=None,
                         help="OpenAI 兼容 API Key (默认读 OPENAI_API_KEY 环境变量)")
     parser.add_argument("--openai-base-url", type=str, default=None,
@@ -1768,7 +1770,13 @@ if __name__ == "__main__":
         print(f"  [邮箱] 固定域名 {domain}" + (f"，前缀 {email_prefix!r}" if email_prefix else "") +
               f"，每个注册任务开始前单独生成")
 
-    proxy = args.proxy or "http://127.0.0.1:7890"
+    if args.no_proxy:
+        proxy = None
+    elif args.proxy:
+        proxy = args.proxy
+    else:
+        # 如果未显式传参，优先从环境变量读取，其次默认为本地代理
+        proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "http://127.0.0.1:7890"
     threads = args.threads or args.count
     run_tasks(args.count, threads, proxy, args.headless, email_list,
               email_domain=email_domain, email_prefix=email_prefix,

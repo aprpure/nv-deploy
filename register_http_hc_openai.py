@@ -1537,12 +1537,11 @@ class NvidiaHttpRegister:
         state = parse_qs(urlparse(final_url).query).get("state")
         if not state:
             raise RuntimeError(f"未从 select-account 提取 state: {final_url}")
-        # 回调 host 优先从 select-account 页面 URL 推导（state 由该 host 签发），
-        # 401 时自动尝试另一个 .com / .cn 变体（venue 与登录回调可能不同域）
-        m = re.match(r"https://(login\.nvidia\.(?:com|cn))", final_url)
-        primary = f"https://{m.group(1)}" if m else self.login_nvidia
-        other = f"https://login.nvidia.cn" if primary.endswith(".com") else f"https://login.nvidia.com"
-        self._p(f"  [NCA] 创建组织 {org_name} (回调 host={primary}) ...")
+        # state 由 login.nvidia.com 签发（consent 阶段），NCA 回调首选 .com；
+        # .cn 仅作为回退（防御性保留，目前实测均 401）
+        primary = "https://login.nvidia.com"
+        other = "https://login.nvidia.cn"
+        self._p(f"  [NCA] 创建组织 {org_name} ...")
         last_err = None
         for base in dict.fromkeys([primary, other]):
             r = self.client.post(f"{base}/callback/nca_picker",

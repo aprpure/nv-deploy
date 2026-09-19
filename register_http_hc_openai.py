@@ -1804,3 +1804,10 @@ if __name__ == "__main__":
     run_tasks(args.count, threads, proxy, args.headless, email_list,
               email_domain=email_domain, email_prefix=email_prefix,
               browser_concurrency=args.browser)
+
+    # ---- 强制收尾：防止 curl_cffi / playwright 残留的非 daemon 线程挂住解释器退出 ----
+    lingering = [t for t in threading.enumerate()
+                 if t is not threading.main_thread() and not t.daemon and t.is_alive()]
+    if lingering:
+        print(f"  [退出] 发现 {len(lingering)} 个残留线程 {[t.name for t in lingering[:8]]}，强制结束进程")
+        os._exit(0)

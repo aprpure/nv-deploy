@@ -106,6 +106,12 @@ browser_semaphore = threading.Semaphore(3)
 
 HCAPTCHA_SITE_KEY = "3443d8f6-da7a-4326-929f-4d7fc89ab0d1"
 
+# hCaptcha 挑战超时预算（秒）：免费/慢速视觉模型单次推理可达 60~90s，
+# 库默认 EXECUTION_TIMEOUT=120 / RESPONSE_TIMEOUT=30 很容易被打爆。
+# 可用环境变量 HC_EXECUTION_TIMEOUT / HC_RESPONSE_TIMEOUT 覆盖。
+HC_EXECUTION_TIMEOUT = float(os.environ.get("HC_EXECUTION_TIMEOUT", "400") or 400)
+HC_RESPONSE_TIMEOUT = float(os.environ.get("HC_RESPONSE_TIMEOUT", "90") or 90)
+
 # LLM 后端类型: "gemini" 走官方 Google Gemini SDK；"openai" 走 OpenAI 兼容端点
 LLM_TYPE = os.environ.get("LLM_TYPE", _llm_cfg["type"])
 
@@ -406,11 +412,13 @@ class OpenAIProvider:
             "model": self._model,
             "messages": messages,
         }
-        # 阿里云百炼/OpenAI 兼容思考模式：enable_thinking + reasoning_effort (+temperature 仍合法)
-        if self._thinking or self._reasoning_effort:
+        # 思考模式：只有显式开启 thinking（--thinking / openai_thinking=true）
+        # 才发送 enable_thinking；thinking 关闭时 reasoning_effort 也不发送，
+        # 避免 "thinking=false + effort=low" 被误打开导致单次推理几十秒。
+        if self._thinking:
             payload["enable_thinking"] = True
-        if self._reasoning_effort:
-            payload["reasoning_effort"] = self._reasoning_effort
+            if self._reasoning_effort:
+                payload["reasoning_effort"] = self._reasoning_effort
         payload["temperature"] = kwargs.get("temperature", 0.1)
         if OPENAI_JSON_MODE:
             payload["response_format"] = {"type": "json_object"}
@@ -1297,33 +1305,13 @@ def _install_challenger_frame_patch():
 
         return await _orig_drag_drop(self, job_type)
 
-    # 4) 增强 _perform_drag_drop 或 challenge_image_drag_drop 的坐标映射
-    _orig_perform_drag = RoboticArm._perform_drag_drop
-
-    async def _perform_drag_with_coordinate_mapping(self, path, steps=25, delay_ms=15):
-        from hcaptcha_challenger.models import SpatialPath, PointCoordinate
-        frame_challenge = await self.get_challenge_frame_locator()
-        if frame_challenge:
-            challenge_view = frame_challenge.locator("//div[@class='challenge-view']")
-            bbox = await challenge_view.bounding_box()
-            if bbox and bbox.get("width", 0) > 0:
-                w, h = bbox["width"], bbox["height"]
-                # 模型识别坐标基于网格大图 (1000x940)，按比例映射到屏幕上的 challenge_view 实际像素位置
-                sx = bbox["x"] + (path.start_point.x / 1000.0) * w
-                sy = bbox["y"] + (path.start_point.y / 940.0) * h
-                tx = bbox["x"] + (path.end_point.x / 1000.0) * w
-                ty = bbox["y"] + (path.end_point.y / 940.0) * h
-                mapped_path = SpatialPath(
-                    start_point=PointCoordinate(x=int(sx), y=int(sy)),
-                    end_point=PointCoordinate(x=int(tx), y=int(ty)),
-                )
-                return await _orig_perform_drag(self, mapped_path, steps, delay_ms)
-        return await _orig_perform_drag(self, path, steps, delay_ms)
+    # 注：原库拖拽坐标系为页面绝对坐标（网格图轴刻度即 bbox 页面坐标，
+    # 模型按轴读数后 _perform_drag_drop 直接使用），不需要 1000x940 二次映射，
+    # 此前加过的映射补丁会把坐标算错，已删除，恢复原生行为。
 
     RoboticArm.get_challenge_frame_locator = _get_frame_retry
     RoboticArm.refresh_challenge = _safe_refresh
     RoboticArm._match_user_prompt = _match_user_prompt_inject
-    RoboticArm._perform_drag_drop = _perform_drag_with_coordinate_mapping
     _orig_drag_drop = RoboticArm.challenge_image_drag_drop
     RoboticArm.challenge_image_drag_drop = challenge_image_drag_drop_guard
     AgentV._review_challenge_type = _review_question_guard
@@ -1401,6 +1389,8 @@ class HcaptchaChallengerSolver:
                     challenge_dir=work_dir / "challenge",
                     captcha_response_dir=work_dir / "captcha",
                     enable_skills_update=False,
+                    EXECUTION_TIMEOUT=HC_EXECUTION_TIMEOUT,
+                    RESPONSE_TIMEOUT=HC_RESPONSE_TIMEOUT,
                 )
                 if LLM_TYPE == "gemini":
                     config.IMAGE_CLASSIFIER_MODEL = GEMINI_MODEL

@@ -20,7 +20,10 @@ import string
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import List, Type, TypeVar
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -127,6 +130,12 @@ OPENAI_JSON_MODE = os.environ.get("OPENAI_JSON_MODE", "1" if _llm_cfg["json_mode
 OPENAI_PROXY = os.environ.get("OPENAI_PROXY", _llm_cfg.get("openai_proxy", _llm_cfg.get("proxy", "")))
 OPENAI_THINKING = (os.environ.get("OPENAI_THINKING", "1" if _llm_cfg["openai_thinking"] else "0") == "1")
 OPENAI_REASONING_EFFORT = (os.environ.get("OPENAI_REASONING_EFFORT", _llm_cfg["openai_reasoning_effort"]) or "").strip().lower()
+OPENAI_RACE_REQUESTS = 2
+_race_env = os.environ.get("OPENAI_RACE_REQUESTS", "").strip().lower()
+if _race_env in {"1", "2"}:
+    OPENAI_RACE_REQUESTS = int(_race_env)
+elif _race_env not in {"", "0", "false", "no", "off"}:
+    raise RuntimeError("OPENAI_RACE_REQUESTS 仅支持 1 或 2")
 
 NGC_LOGIN_URL = "https://api.ngc.nvidia.com/login"
 NVGS_BASE = "https://accounts.nvgs.nvidia.com/api/1/frontend/oauth"
@@ -141,6 +150,29 @@ csv_lock = threading.Lock()
 CHECKBOX_IFRAME = 'iframe[src*="frame=checkbox"]'
 
 ResponseT = TypeVar("ResponseT")
+
+
+class RegisterStage(str, Enum):
+    INIT = "init"
+    OAUTH = "oauth"
+    NVGS_REGISTER = "nvgs_register"
+    EMAIL_VERIFY = "email_verify"
+    PROFILE = "profile"
+    SESSION = "session"
+    NCA = "nca"
+    NGC_KEY = "ngc_key"
+    PERSIST = "persist"
+    DONE = "done"
+
+
+@dataclass
+class RegisterResult:
+    task_id: int
+    email: str = ""
+    success: bool = False
+    stage: RegisterStage = RegisterStage.INIT
+    error: str = ""
+    api_key: str | None = field(default=None, repr=False)
 
 
 def generate_password():
@@ -357,6 +389,9 @@ class OpenAIProvider:
             client_kwargs["proxy"] = proxy
         self._client = httpx.AsyncClient(**client_kwargs)
 
+    async def aclose(self):
+        await self._client.aclose()
+
     def _parse_response(self, text: str, response_schema: Type[ResponseT]) -> ResponseT:
         text = text.strip()
         if text.startswith("```"):
@@ -424,23 +459,62 @@ class OpenAIProvider:
             payload["response_format"] = {"type": "json_object"}
 
         last_err = None
+        race_count = max(1, OPENAI_RACE_REQUESTS)
+        if race_count > 1:
+            print(f"  [AI-Race] 启用 {race_count} 路并发请求，采用首个有效结果", flush=True)
+
+        async def request_once(request_no: int):
+            resp = await self._client.post("/chat/completions", json=payload)
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"]
+            elapsed = time.time() - t0
+            print(
+                f"  [AI-Resp] 请求 {request_no} 成功 "
+                f"(耗时 {elapsed:.1f}s, 输出长度 {len(text)} 字符)",
+                flush=True,
+            )
+            return self._parse_response(text, response_schema)
+
         for attempt in range(3):
-            try:
-                resp = await self._client.post("/chat/completions", json=payload)
-                resp.raise_for_status()
-                text = resp.json()["choices"][0]["message"]["content"]
-                elapsed = time.time() - t0
-                print(f"  [AI-Resp] 模型响应成功 (耗时 {elapsed:.1f}s, 输出长度 {len(text)} 字符)", flush=True)
-                return self._parse_response(text, response_schema)
-            except Exception as e:
-                last_err = e
-                if isinstance(e, httpx.HTTPError):
-                    req = getattr(e, "request", None)
-                    print(f"  [AI] 尝试 {attempt+1}/3 失败: {type(e).__name__}: {str(e)[:150]}"
-                          + (f" ({req.url.host})" if req is not None else ""), flush=True)
-                if attempt < 2:
-                    is_429 = isinstance(e, httpx.HTTPStatusError) and getattr(e.response, "status_code", None) == 429
-                    await asyncio.sleep(10 if is_429 else 2 * (attempt + 1))
+            tasks = [
+                asyncio.create_task(request_once(request_no))
+                for request_no in range(1, race_count + 1)
+            ]
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    try:
+                        result = task.result()
+                    except Exception as e:
+                        last_err = e
+                        if isinstance(e, httpx.HTTPError):
+                            req = getattr(e, "request", None)
+                            print(
+                                f"  [AI] 尝试 {attempt+1}/3 失败: "
+                                f"{type(e).__name__}: {str(e)[:150]}"
+                                + (f" ({req.url.host})" if req is not None else ""),
+                                flush=True,
+                            )
+                        continue
+                    other_tasks = [candidate for candidate in tasks if candidate is not task]
+                    for loser in other_tasks:
+                        if not loser.done():
+                            loser.cancel()
+                    if other_tasks:
+                        await asyncio.gather(*other_tasks, return_exceptions=True)
+                    if race_count > 1:
+                        print("  [AI-Race] 已获得首个有效结果，取消其余请求", flush=True)
+                    return result
+
+            if attempt < 2:
+                is_429 = (
+                    isinstance(last_err, httpx.HTTPStatusError)
+                    and getattr(last_err.response, "status_code", None) == 429
+                )
+                await asyncio.sleep(10 if is_429 else 2 * (attempt + 1))
         raise RuntimeError(f"OpenAI 请求失败: {last_err}")
 
 
@@ -1320,10 +1394,13 @@ def _install_challenger_frame_patch():
 
 # ---------------- hCaptcha Challenger 求解器（本地浏览器 + OpenAI 视觉模型） ----------------
 class HcaptchaChallengerSolver:
-    def __init__(self, proxy=None, headless=False, tag=""):
+    def __init__(self, proxy=None, headless=False, tag="", task_id=None,
+                 browser_semaphore=None):
         self.proxy = proxy
         self.headless = headless
         self.tag = tag
+        self.task_id = task_id
+        self.browser_semaphore = browser_semaphore
 
     def _p(self, *args):
         print(self.tag or "[?]", *args, flush=True)
@@ -1332,7 +1409,9 @@ class HcaptchaChallengerSolver:
         last_err = None
         for attempt in range(1, 4):
             try:
-                return asyncio.run(self._solve_async())
+                semaphore = self.browser_semaphore or nullcontext()
+                with semaphore:
+                    return asyncio.run(self._solve_async())
             except Exception as e:
                 last_err = e
                 self._p(f"  [验证] 挑战第 {attempt} 次失败: {e}，重试...")
@@ -1350,11 +1429,13 @@ class HcaptchaChallengerSolver:
             launch_kwargs = {"headless": self.headless}
             if self.proxy:
                 launch_kwargs["proxy"] = {"server": self.proxy}
-            browser = await p.chromium.launch(**launch_kwargs)
-            context = await browser.new_context(user_agent=UA, locale="zh-CN")
-            page = await context.new_page()
-
+            browser = None
+            context = None
+            agent = None
             try:
+                browser = await p.chromium.launch(**launch_kwargs)
+                context = await browser.new_context(user_agent=UA, locale="zh-CN")
+                page = await context.new_page()
                 await page.goto("https://login.nvgs.nvidia.com/v1/login",
                                 wait_until="domcontentloaded", timeout=30000)
 
@@ -1411,12 +1492,32 @@ class HcaptchaChallengerSolver:
                     return token
                 raise RuntimeError(f"挑战未通过: {signal}")
             finally:
-                await browser.close()
+                if agent is not None:
+                    for reasoner in (
+                        agent.robotic_arm._challenge_router,
+                        agent.robotic_arm._image_classifier,
+                        agent.robotic_arm._spatial_path_reasoner,
+                        agent.robotic_arm._spatial_point_reasoner,
+                    ):
+                        provider = getattr(reasoner, "_provider", None)
+                        close = getattr(provider, "aclose", None)
+                        if close is not None:
+                            try:
+                                await close()
+                            except Exception:
+                                pass
+                try:
+                    if context is not None:
+                        await context.close()
+                finally:
+                    if browser is not None:
+                        await browser.close()
 
 
 # ---------------- 纯 HTTP 注册器 ----------------
 class NvidiaHttpRegister:
-    def __init__(self, proxy=None, headless=False, email_address=None):
+    def __init__(self, proxy=None, headless=False, email_address=None, task_id=None,
+                 browser_semaphore=None):
         client_args = {"headers": {"User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9"},
                        "timeout": 30, "follow_redirects": False}
         if proxy:
@@ -1424,9 +1525,13 @@ class NvidiaHttpRegister:
         self.proxy = proxy
         self.client = httpx.Client(**client_args)
         self.mail = TempMailService(proxy=proxy, email_address=email_address)
-        self.captcha = HcaptchaChallengerSolver(proxy=proxy, headless=headless,
-                                                tag=f"[{email_address}]" if email_address else "")
+        self.captcha = HcaptchaChallengerSolver(
+            proxy=proxy, headless=headless,
+            tag=f"[{email_address}]" if email_address else "",
+            task_id=task_id, browser_semaphore=browser_semaphore,
+        )
         self.key = None
+        self.stage = RegisterStage.INIT
         self._email = email_address or ""
         # NVGS 端点（默认 .com；若会话重定向落到 .cn 域名则动态切换）
         self.nvgs_login = "https://login.nvgs.nvidia.com"
@@ -1457,6 +1562,9 @@ class NvidiaHttpRegister:
         except Exception:
             pass
         self.mail.close()
+
+    def _set_stage(self, stage: RegisterStage):
+        self.stage = stage
 
     # ---- 通用工具 ----
     def _walk_redirects(self, url, max_hops=15):
@@ -1513,6 +1621,7 @@ class NvidiaHttpRegister:
 
     # ---- 1. OAuth 入口 ----
     def oauth_entry(self, email):
+        self._set_stage(RegisterStage.OAUTH)
         params = urlencode({"email": email, "app": "api-catalog",
                             "redirect_uri": "https://build.nvidia.com/"})
         r = self._walk_redirects(f"{NGC_LOGIN_URL}?{params}")
@@ -1534,6 +1643,7 @@ class NvidiaHttpRegister:
 
     # ---- 2. NVGS 注册 ----
     def nvgs_register(self, email, password, device_id):
+        self._set_stage(RegisterStage.NVGS_REGISTER)
         self._p("  [NVGS] 初始化...")
         self._nvgs("POST", "/initialize/check",
                    {"browserMode": "Private", "passkeySupported": True})
@@ -1609,6 +1719,7 @@ class NvidiaHttpRegister:
 
     # ---- 3. 邮箱验证 ----
     def email_verify(self, user_token):
+        self._set_stage(RegisterStage.EMAIL_VERIFY)
         self._p("  [验证] 等待邮箱验证邮件并轮询...")
         last_wrong_at = 0.0
         for attempt in range(45):
@@ -1636,6 +1747,7 @@ class NvidiaHttpRegister:
 
     # ---- 4. profile / passkey ----
     def finish_profile(self):
+        self._set_stage(RegisterStage.PROFILE)
         r = self._nvgs("POST", "/user/profile/complete", {"emailVerification": True})
         self.key = r.json()["key"]
 
@@ -1651,6 +1763,7 @@ class NvidiaHttpRegister:
 
     # ---- 5. 同意页 + 会话 ----
     def consent_and_session(self, external_url):
+        self._set_stage(RegisterStage.SESSION)
         r = self._walk_redirects(external_url)
         final_url = str(r.url)
         if "static-login.nvidia.com" in final_url or "/consent" in final_url:
@@ -1689,6 +1802,7 @@ class NvidiaHttpRegister:
 
     # ---- 6. 自动登录 ----
     def auto_login(self, user_token):
+        self._set_stage(RegisterStage.SESSION)
         self._nvgs("POST", "/initialize/check",
                    {"browserMode": "Private", "passkeySupported": True})
         self._nvgs("POST", "/user/info/get", {"values": [user_token]})
@@ -1702,6 +1816,7 @@ class NvidiaHttpRegister:
 
     # ---- 7. NCA 创建 ----
     def create_nca(self, external_url, org_name):
+        self._set_stage(RegisterStage.NCA)
         r = self._walk_redirects(external_url)
         final_url = str(r.url)
         if "select-account" not in final_url:
@@ -1733,6 +1848,7 @@ class NvidiaHttpRegister:
 
     # ---- 8. NGC API ----
     def ngc_create_key(self, org_name):
+        self._set_stage(RegisterStage.NGC_KEY)
         ngc = "https://api.ngc.nvidia.com"
         h = {"Origin": "https://build.nvidia.com", "Referer": "https://build.nvidia.com/"}
         self.client.headers.update(h)
@@ -1817,8 +1933,7 @@ class NvidiaHttpRegister:
         self._p(f"开始注册 (deviceId={device_id}, org={org_name})")
 
         self.oauth_entry(email)
-        with browser_semaphore:
-            user_token = self.nvgs_register(email, password, device_id)
+        user_token = self.nvgs_register(email, password, device_id)
         self.email_verify(user_token)
         external_url = self.finish_profile()
         need_round2 = self.consent_and_session(external_url)
@@ -1826,8 +1941,10 @@ class NvidiaHttpRegister:
             external_url2 = self.auto_login(user_token)
             self.create_nca(external_url2, org_name)
         api_key = self.ngc_create_key(org_name)
+        self._set_stage(RegisterStage.PERSIST)
         save_to_csv(email, password, api_key)
-        self._p(f"✅ 完成: {api_key}")
+        self._set_stage(RegisterStage.DONE)
+        self._p("✅ 完成")
         return api_key
 
 
@@ -1838,19 +1955,34 @@ def register_process(thread_id, proxy, headless, email_address=None,
         user = f"{email_prefix}{''.join(random.choices(chars, k=8))}" if email_prefix \
             else "".join(random.choices(chars, k=12))
         email_address = f"{user}@{email_domain}"
-    reg = NvidiaHttpRegister(proxy=proxy, headless=headless, email_address=email_address)
+    reg = None
+    result = RegisterResult(task_id=thread_id, email=email_address or "")
     t = f"[{email_address}]" if email_address else f"[Thread-{thread_id}]"
     try:
+        reg = NvidiaHttpRegister(
+            proxy=proxy, headless=headless, email_address=email_address,
+            task_id=thread_id, browser_semaphore=browser_semaphore,
+        )
         if not email_address:
             email_address = reg.mail.get_email()
-            t = f"[{email_address}]"
-        reg.run()
+            result.email = email_address or ""
+            t = f"[{email_address}]" if email_address else t
+        api_key = reg.run()
+        result.email = reg._email or result.email
+        result.stage = reg.stage
+        result.api_key = api_key
+        result.success = True
+        print(f"{t} ✅ 成功 (阶段={reg.stage.value})", flush=True)
     except Exception as e:
         import traceback
         traceback.print_exc()
-        print(f"{t} ❌ 失败: {e}", flush=True)
+        result.stage = reg.stage if reg is not None else RegisterStage.INIT
+        result.error = f"{type(e).__name__}: {e}"
+        print(f"{t} ❌ 失败 (阶段={result.stage.value}): {result.error}", flush=True)
     finally:
-        reg.close()
+        if reg is not None:
+            reg.close()
+    return result
 
 
 def run_tasks(count, workers, proxy, headless, email_list=None,
@@ -1862,6 +1994,7 @@ def run_tasks(count, workers, proxy, headless, email_list=None,
           f"代理 {proxy or '直连'}, headless={headless}"
           + (f", 自定义邮箱 {len(email_list)} 个" if email_list else "") + " ===")
     emails = list(email_list or [])
+    results = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = []
         for i in range(count):
@@ -1870,10 +2003,13 @@ def run_tasks(count, workers, proxy, headless, email_list=None,
                                            email_domain=email_domain, email_prefix=email_prefix))
         for f in as_completed(futures):
             try:
-                f.result()
+                results.append(f.result())
             except Exception:
                 pass
-    print("=== 全部结束 ===")
+    succeeded = sum(1 for result in results if result and result.success)
+    failed = len(results) - succeeded
+    print(f"=== 全部结束: 成功 {succeeded}, 失败 {failed} ===")
+    return {"total": len(results), "success": succeeded, "failed": failed, "results": results}
 
 
 if __name__ == "__main__":
@@ -1984,9 +2120,11 @@ if __name__ == "__main__":
         # 如果未显式传参，优先从环境变量读取，其次默认为本地代理
         proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "http://127.0.0.1:7890"
     threads = args.threads or args.count
-    run_tasks(args.count, threads, proxy, args.headless, email_list,
-              email_domain=email_domain, email_prefix=email_prefix,
-              browser_concurrency=args.browser)
+    stats = run_tasks(args.count, threads, proxy, args.headless, email_list,
+                      email_domain=email_domain, email_prefix=email_prefix,
+                      browser_concurrency=args.browser)
+    if stats["failed"]:
+        raise SystemExit(1)
 
     # ---- 强制收尾：防止 curl_cffi / playwright 残留的非 daemon 线程挂住解释器退出 ----
     lingering = [t for t in threading.enumerate()

@@ -58,6 +58,12 @@ uv run python register_http_hc_openai.py -c 3 --email-domain your.domain --email
 
 # 从文件读取自定义邮箱列表（每行一个，# 注释）
 uv run python register_http_hc_openai.py -c 10 --email-file emails.txt
+
+# 指定结果文件（默认写入脚本目录下的 nvidia_keys.csv）
+uv run python register_http_hc_openai.py -c 1 --output results/keys.csv
+
+# 只检查配置和 provider，不创建账号或发送请求
+uv run python register_http_hc_openai.py --check-config
 ```
 
 ### 常用参数
@@ -75,13 +81,18 @@ uv run python register_http_hc_openai.py -c 10 --email-file emails.txt
 | `--thinking / --reasoning-effort` | 推理模型思考模式开关与强度 |
 | `--email / --email-file` | 自定义邮箱地址 / 列表文件 |
 | `--email-domain / --email-user` | 固定域名自动生成邮箱 |
+| `--output` | 结果 CSV 路径（默认脚本目录下的 `nvidia_keys.csv`） |
+| `--check-config` | 只检查配置、依赖和邮箱 provider，不创建账号或发送请求 |
 
 完整参数：`uv run python register_http_hc_openai.py --help`
 
 ## 输出
 
-注册成功后结果追加写入工作目录下的 `nvidia_keys.csv`
-（列：`email,password,api_key,created_at`），日志实时打印到控制台。
+注册成功后结果追加写入脚本目录下的 `nvidia_keys.csv`，也可以通过 `config.json` 的
+`output` 或命令行 `--output` 指定路径（相对路径以脚本目录为基准）。
+CSV 列：`email,password,api_key,created_at`，日志实时打印到控制台。
+
+进程退出码为 `0` 表示所有任务成功；任一任务失败或配置/参数校验失败时返回 `1`。
 
 ## 常见问题
 
